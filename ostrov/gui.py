@@ -120,8 +120,12 @@ class Observer:
             for entry in world.brain_history[-30:]:
                 if 'error' in entry:
                     text = 'Ошибка: ' + entry['error']
+                    if entry.get('rejected_response'):
+                        text += '\nОтклонённый ответ: ' + entry['rejected_response']
                 else:
                     text = '; '.join(f'{a["creature_id"]}: {a["type"]} ' + (a.get('text', '') if a['type'] == 'say' else str({k: v for k, v in a.items() if k in ('dx', 'dy')})) for a in entry['response']['actions'])
+                    if entry.get('normalization'):
+                        text += '\n' + '; '.join(entry['normalization'])
                 self.brain_log.insert('end', f'DeepSeek · {entry["time"]:.0f} с · {text}\n')
             self.brain_log.see('end')
             self.brain_log.configure(state='disabled')

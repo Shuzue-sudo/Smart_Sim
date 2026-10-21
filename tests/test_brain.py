@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 import urllib.error
 
-from ostrov.brain import BrainError, BrainLoop, DeepSeekClient, Settings, apply_actions, context
+from ostrov.brain import BrainError, BrainLoop, DeepSeekClient, Settings, apply_actions, context, prepare_actions
 from ostrov.engine import Creature, World
 from ostrov.storage import load, save
 
@@ -132,6 +132,57 @@ class BrainTests(unittest.TestCase):
         for settings in [Settings(enabled=True), Settings(interval=float('nan')), Settings(interval=0), Settings(model='bad')]:
             with self.assertRaises(ValueError):
                 settings.validate()
+
+    def test_normalization_keeps_step_bound_and_does_not_mutate_reply(self):
+        world = World()
+        original = result(' MOVE ', dx='3', dy='4', text=None)
+        prepared, notes = prepare_actions(world, original)
+        self.assertEqual(original['actions'][0]['dx'], '3')
+        action = prepared['actions'][0]
+        self.assertAlmostEqual(action['dx'], 1.2)
+        self.assertAlmostEqual(action['dy'], 1.6)
+        self.assertTrue(notes)
+        apply_actions(world, prepared)
+        self.assertLessEqual((world.creatures['rosmontis'].x**2 + world.creatures['rosmontis'].y**2)**.5, 2)
+        prepared, _ = prepare_actions(world, result('wait', dx=None, dy=None, text=''))
+        self.assertEqual(prepared, result())
+
+    def test_normalization_never_accepts_unknown_state_changes(self):
+        world = World()
+        before = world.snapshot()
+        for reply in [result('wait', health=200), result('teleport', x=0, y=0),
+                      result('move', dx='NaN', dy=0), result('move', dx=True, dy=0),
+                      result('move', dx='Infinity', dy=0), result('move', dx=10**400, dy=0),
+                      result('say', text='a'*501), result('say', text='')]:
+            with self.assertRaises(BrainError):
+                prepare_actions(world, reply)
+            self.assertEqual(world.snapshot(), before)
+
+    def test_rejected_reply_has_specific_error_and_persistable_redacted_diagnostic(self):
+        world, loop = World(), BrainLoop()
+        loop.settings = Settings(api_key='test-secret')
+        loop.pending = True
+        loop.results.put((loop.epoch, result('wait', reason='test-secret'), None))
+        loop.step(world, 1, 1)
+        self.assertTrue(world.paused)
+        self.assertIn('Действие №1', loop.error)
+        self.assertIn('для wait нужны только поля', loop.error)
+        self.assertNotIn('test-secret', json.dumps(world.snapshot()))
+        self.assertIn('REDACTED', world.brain_history[-1]['rejected_response'])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'rejected.sqlite3'
+            save(world, path)
+            self.assertEqual(load(path).brain_history, world.brain_history)
+
+    def test_loop_applies_normalized_response_and_records_adjustment(self):
+        world, loop = World(), BrainLoop()
+        loop.pending = True
+        loop.results.put((loop.epoch, result('move', dx=3, dy=4), None))
+        loop.step(world, 1, 1)
+        self.assertIsNone(loop.error)
+        self.assertFalse(world.paused)
+        self.assertTrue(world.brain_history[-1]['normalization'])
+        self.assertAlmostEqual(world.creatures['rosmontis'].x, 1.2)
 
 
 if __name__ == '__main__':

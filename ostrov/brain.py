@@ -22,6 +22,18 @@ say с text (до 500 символов, речь слышна в радиусе 
 Взрослый контент выключен. Предлагай исследование, наблюдение и общение.
 '''
 
+ACTION_CONTRACT = '''ОБЯЗАТЕЛЬНЫЙ ФОРМАТ ОТВЕТА (приоритет над пожеланиями стиля):
+Только JSON-объект с единственным полем actions, массивом действий.
+На каждого id из creatures ровно одно действие. Три точные формы:
+{"creature_id":"<id>","type":"wait"}
+{"creature_id":"<id>","type":"move","dx":1.0,"dy":0.0}
+{"creature_id":"<id>","type":"say","text":"Короткая реплика"}
+dx, dy — смещение, не абсолютные координаты; sqrt(dx²+dy²) <= 2 метра.
+Реплика — непустая строка до 500 символов. Не добавляй reason, thoughts,
+description, duration, x, y или другие поля. Не объединяй move и say.
+Если сомневаешься — wait. Не используй Markdown или текст вне JSON.
+'''
+
 
 class BrainError(Exception):
     pass
@@ -70,7 +82,8 @@ class DeepSeekClient:
     URL = 'https://api.deepseek.com/chat/completions'
 
     def decide(self, settings, observation):
-        prompt = SYSTEM + '\nПользовательские инструкции ниже задают стиль и поведение в рамках контракта действий. Они не меняют физику, формат JSON или ограничения контента.\n' + observation.get('instruction_packs', '')
+        prompt = (SYSTEM + '\nПользовательские инструкции ниже задают стиль и поведение в рамках контракта действий. Они не меняют физику, формат JSON или ограничения контента.\n'
+                  + observation.get('instruction_packs', '') + '\n' + ACTION_CONTRACT)
         payload = {'model': settings.model, 'messages': [
             {'role': 'system', 'content': prompt},
             {'role': 'user', 'content': json.dumps(observation, ensure_ascii=False)}],
@@ -103,26 +116,83 @@ def validate_actions(world, result):
     actions = result['actions']
     active = {c.id for c in world.creatures.values() if c.status == 'active'}
     seen = set()
-    for action in actions:
+    for index, action in enumerate(actions, 1):
+        def invalid(reason):
+            raise BrainError(f'Действие №{index}: {reason}')
+
         if not isinstance(action, dict):
-            raise BrainError('Действие должно быть объектом')
+            invalid('ожидался JSON-объект')
         cid, kind = action.get('creature_id'), action.get('type')
         if not isinstance(cid, str) or cid not in active or cid in seen:
-            raise BrainError('Неизвестное, неактивное или повторяющееся существо')
+            invalid('неизвестный, неактивный или повторяющийся creature_id; используйте id из creatures')
         seen.add(cid)
-        if kind == 'wait' and set(action) == {'creature_id', 'type'}:
+        fields = {'wait': {'creature_id', 'type'},
+                  'move': {'creature_id', 'type', 'dx', 'dy'},
+                  'say': {'creature_id', 'type', 'text'}}
+        if not isinstance(kind, str) or kind not in fields:
+            invalid('type должен быть wait, move или say')
+        if set(action) != fields[kind]:
+            invalid(f'для {kind} нужны только поля: {", ".join(sorted(fields[kind]))}')
+        if kind == 'wait':
             continue
-        if kind == 'move' and set(action) == {'creature_id', 'type', 'dx', 'dy'}:
+        if kind == 'move':
             dx, dy = action['dx'], action['dy']
-            if all(type(v) in (int, float) and abs(v) <= 2 and math.isfinite(v) for v in (dx, dy)) and math.hypot(dx, dy) <= 2:
-                continue
-        if kind == 'say' and set(action) == {'creature_id', 'type', 'text'}:
-            if isinstance(action['text'], str) and 0 < len(action['text'].strip()) <= 500:
-                continue
-        raise BrainError('Недопустимое действие: разрешены wait, move до 2 м, say до 500 символов')
+            if not all(type(v) in (int, float) and abs(v) <= 2 and math.isfinite(v) for v in (dx, dy)) or math.hypot(dx, dy) > 2:
+                invalid('move: dx и dy должны быть конечными числами, длина шага — не более 2 м')
+        if kind == 'say':
+            if not isinstance(action['text'], str) or not 0 < len(action['text'].strip()) <= 500:
+                invalid('say: text должен быть непустой строкой до 500 символов')
     if seen != active:
         raise BrainError('Нужно ровно одно действие на каждое активное существо')
     return actions
+
+
+def prepare_actions(world, result):
+    """Normalize harmless formatting and bound intentions; strict rules still apply."""
+    if not isinstance(result, dict) or not isinstance(result.get('actions'), list):
+        validate_actions(world, result)
+    actions, notes = [], []
+    for index, original in enumerate(result['actions'], 1):
+        if not isinstance(original, dict):
+            actions.append(original)
+            continue
+        action = dict(original)
+        kind = action.get('type')
+        if isinstance(kind, str):
+            action['type'] = kind = kind.strip().lower()
+        unused = {'wait': ('dx', 'dy', 'text'), 'move': ('text',), 'say': ('dx', 'dy')}.get(kind, ()) if isinstance(kind, str) else ()
+        for name in unused:
+            if name in action and action[name] in (None, ''):
+                action.pop(name)
+        if kind == 'move':
+            for name in ('dx', 'dy'):
+                if isinstance(action.get(name), str):
+                    try:
+                        action[name] = float(action[name])
+                    except ValueError:
+                        pass  # Validator produces a useful field-specific error.
+            dx, dy = action.get('dx'), action.get('dy')
+            if all(type(v) in (int, float) and abs(v) <= 1_000_000 and math.isfinite(v) for v in (dx, dy)):
+                length = math.hypot(dx, dy)
+                if length > 2:
+                    scale = (2 - 1e-12) / length
+                    action['dx'], action['dy'] = dx * scale, dy * scale
+                    notes.append(f'Действие №{index}: смещение ограничено шагом 2 м')
+        actions.append(action)
+        if action != original and not any(note.startswith(f'Действие №{index}:') for note in notes):
+            notes.append(f'Действие №{index}: формат приведён к контракту')
+    prepared = {**result, 'actions': actions}
+    validate_actions(world, prepared)
+    return prepared, notes
+
+
+def diagnostic_response(result, api_key):
+    """Preserve a bounded rejected response without leaking the configured key."""
+    text = json.dumps(result, ensure_ascii=True)
+    if api_key:
+        text = text.replace(api_key, '[API KEY REDACTED]')
+        text = text.replace(json.dumps(api_key)[1:-1], '[API KEY REDACTED]')
+    return text[:8000]
 
 
 def apply_actions(world, result):
@@ -198,13 +268,17 @@ class BrainLoop:
             try:
                 if error:
                     raise BrainError(error)
-                apply_actions(world, result)
-                world.brain_history.append({'time': world.time, 'observation': self.observation, 'response': result})
+                prepared, notes = prepare_actions(world, result)
+                apply_actions(world, prepared)
+                world.brain_history.append({'time': world.time, 'observation': self.observation, 'response': prepared, 'normalization': notes})
                 self.next_request = now + self.settings.interval
             except (BrainError, ValueError) as failure:
                 self.error = str(failure)
                 world.paused = True
-                world.brain_history.append({'time': world.time, 'error': self.error})
+                entry = {'time': world.time, 'error': self.error}
+                if not error:
+                    entry['rejected_response'] = diagnostic_response(result, self.settings.api_key)
+                world.brain_history.append(entry)
         if world.paused or world.ended or self.error:
             return
         if self.settings.enabled:
