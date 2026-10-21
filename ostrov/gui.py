@@ -1,5 +1,6 @@
 """Tk desktop observer. All world mutations go through the simulation core."""
 import math
+import os
 import sqlite3
 import time
 import tkinter as tk
@@ -7,6 +8,7 @@ from tkinter import filedialog, font, messagebox, simpledialog, ttk
 from uuid import uuid4
 
 from .engine import Creature, World
+from .brain import BrainLoop, Settings
 from .storage import load, save
 
 
@@ -21,6 +23,7 @@ class Observer:
                 font.nametofont(name, root=root).configure(family=preferred)
         self.world = world or World()
         self.world.paused = True
+        self.brain = BrainLoop()
         self.selected = 'rosmontis'
         self.last_tick = time.monotonic()
         self.timer = None
@@ -40,6 +43,12 @@ class Observer:
         for label, command in [('Новый мир', self.new_world), ('Сохранить', self.save_world), ('Загрузить', self.load_world), ('Создать существо', self.create_creature)]:
             ttk.Button(toolbar, text=label, command=command).pack(side='left', padx=5)
         self.status = tk.StringVar()
+        brainbar = ttk.Frame(root, padding=(8, 0))
+        brainbar.pack(fill='x')
+        ttk.Button(brainbar, text='Настройки DeepSeek', command=self.configure_brain).pack(side='left')
+        ttk.Button(brainbar, text='Лорбуки / инструкции', command=self.configure_lore).pack(side='left', padx=8)
+        self.brain_status = tk.StringVar(value='DeepSeek выключен')
+        ttk.Label(brainbar, textvariable=self.brain_status, wraplength=850).pack(side='left', padx=8)
         ttk.Label(root, textvariable=self.status, padding=8).pack(fill='x')
         body = ttk.Frame(root)
         body.pack(fill='both', expand=True)
@@ -60,6 +69,9 @@ class Observer:
         ttk.Label(root, text='Журнал мира', padding=5).pack(anchor='w')
         self.log = tk.Text(root, height=6, state='disabled', wrap='word')
         self.log.pack(fill='x')
+        self.brain_log = tk.Text(root, height=3, state='disabled', wrap='word')
+        self.brain_log.pack(fill='x')
+        self.brain_log_signature = None
         self.log_signature = None
         self.render()
         self.tick()
@@ -79,6 +91,8 @@ class Observer:
 
     def toggle_pause(self):
         if not self.world.ended:
+            if self.world.paused and self.brain.error:
+                self.brain.reset()
             self.world.paused = not self.world.paused
             self.last_tick = time.monotonic()
         self.render()
@@ -88,13 +102,30 @@ class Observer:
 
     def tick(self):
         now = time.monotonic()
-        self.world.advance(now - self.last_tick)
+        self.brain.step(self.world, now, now - self.last_tick)
         self.last_tick = now
         self.render()
         self.timer = self.root.after(50, self.tick)
 
     def render(self):
         world = self.world
+        brain_state = 'выключен'
+        if self.brain.settings.enabled:
+            brain_state = self.brain.error or ('ожидание API (время остановлено)' if self.brain.pending else 'включён')
+        self.brain_status.set('DeepSeek: ' + brain_state)
+        signature = (id(world), len(world.brain_history))
+        if signature != self.brain_log_signature:
+            self.brain_log.configure(state='normal')
+            self.brain_log.delete('1.0', 'end')
+            for entry in world.brain_history[-30:]:
+                if 'error' in entry:
+                    text = 'Ошибка: ' + entry['error']
+                else:
+                    text = '; '.join(f'{a["creature_id"]}: {a["type"]} ' + (a.get('text', '') if a['type'] == 'say' else str({k: v for k, v in a.items() if k in ('dx', 'dy')})) for a in entry['response']['actions'])
+                self.brain_log.insert('end', f'DeepSeek · {entry["time"]:.0f} с · {text}\n')
+            self.brain_log.see('end')
+            self.brain_log.configure(state='disabled')
+            self.brain_log_signature = signature
         self.canvas.delete('all')
         points = []
         # Sample the same polar interpolation as the engine, rather than joining
@@ -167,6 +198,9 @@ class Observer:
             self.render()
 
     def move_at(self, event):
+        if self.brain.pending:
+            messagebox.showinfo('DeepSeek', 'Дождитесь ответа API перед изменением сцены.', parent=self.root)
+            return
         x, y = self.coordinates(event)
         if not self.world.ended and not self.world.contains(x, y):
             if not messagebox.askyesno('Падение', 'Перенос за край убьёт существо. Продолжить?', parent=self.root):
@@ -178,7 +212,7 @@ class Observer:
         self.render()
 
     def create_creature(self):
-        if self.world.ended:
+        if self.world.ended or self.brain.pending:
             return
         name = simpledialog.askstring('Создать существо', 'Имя (появится у дуба):', parent=self.root)
         if not name or not name.strip():
@@ -192,12 +226,49 @@ class Observer:
         self.render()
 
     def replace_world(self, world):
+        self.brain.reset()
         self.world = world
         world.paused = True
         self.selected = 'rosmontis'
         self.speed.set(str(world.speed))
         self.last_tick = time.monotonic()
         self.render()
+
+    def configure_brain(self):
+        self.world.paused = True
+        dialog = tk.Toplevel(self.root)
+        dialog.title('Мозг DeepSeek')
+        dialog.transient(self.root)
+        dialog.grab_set()
+        settings = self.brain.settings
+        enabled = tk.BooleanVar(value=settings.enabled)
+        key = tk.StringVar(value=settings.api_key or os.environ.get('DEEPSEEK_API_KEY', ''))
+        model = tk.StringVar(value=settings.model)
+        interval = tk.StringVar(value=str(settings.interval))
+        frame = ttk.Frame(dialog, padding=16)
+        frame.pack(fill='both', expand=True)
+        ttk.Checkbutton(frame, text='Включить DeepSeek', variable=enabled).pack(anchor='w')
+        ttk.Label(frame, text='API-ключ (только в памяти приложения)').pack(anchor='w', pady=(10, 0))
+        ttk.Entry(frame, textvariable=key, show='*', width=48).pack(fill='x')
+        ttk.Label(frame, text='Модель').pack(anchor='w', pady=(10, 0))
+        ttk.Combobox(frame, textvariable=model, values=('deepseek-chat', 'deepseek-reasoner'), state='readonly').pack(fill='x')
+        ttk.Label(frame, text='Интервал между ответом и новым запросом, реальные секунды').pack(anchor='w', pady=(10, 0))
+        ttk.Entry(frame, textvariable=interval).pack(fill='x')
+        ttk.Label(frame, text='Состояние существ отправляется DeepSeek.\nВо время запроса игровое время остановлено.\nПри ошибке — пауза; «Продолжить» повторит запрос.').pack(anchor='w', pady=10)
+
+        def apply():
+            try:
+                self.brain.configure(Settings(key.get().strip(), model.get(), float(interval.get()), enabled.get()))
+            except ValueError as error:
+                messagebox.showerror('Настройки', str(error), parent=dialog)
+                return
+            dialog.destroy()
+            self.render()
+        ttk.Button(frame, text='Применить', command=apply).pack(anchor='e')
+
+    def configure_lore(self):
+        from .lore_editor import LoreEditor
+        LoreEditor(self)
 
     def new_world(self):
         if messagebox.askyesno('Новый мир', 'Несохранённое состояние будет потеряно. Создать мир?', parent=self.root):

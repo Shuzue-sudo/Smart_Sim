@@ -1,5 +1,6 @@
 """Desktop integration checks. Run with DISPLAY (or Xvfb on Linux)."""
 import os
+import json
 from pathlib import Path
 import tempfile
 import tkinter as tk
@@ -10,6 +11,8 @@ from unittest.mock import patch
 from ostrov.engine import World
 from ostrov.gui import Observer
 from ostrov.storage import load
+from ostrov.brain import context
+from ostrov.lore_editor import LoreEditor
 
 
 @unittest.skipUnless(os.name == 'nt' or os.environ.get('DISPLAY'), 'Требуется графический дисплей')
@@ -68,3 +71,43 @@ class ObserverTests(unittest.TestCase):
                 self.app.create_creature()
             self.assertEqual(len(self.app.world.creatures), 10)
             error.assert_called_once()
+
+    def test_deepseek_settings_dialog(self):
+        self.app.configure_brain()
+        dialog = next(w for w in self.root.winfo_children() if isinstance(w, tk.Toplevel))
+        frame = dialog.winfo_children()[0]
+        children = frame.winfo_children()
+        from tkinter import ttk
+        check = next(w for w in children if isinstance(w, ttk.Checkbutton))
+        key = next(w for w in children if isinstance(w, ttk.Entry) and w.cget('show') == '*')
+        apply = next(w for w in children if isinstance(w, ttk.Button))
+        check.invoke()
+        key.delete(0, 'end')
+        key.insert(0, 'test-key')
+        apply.invoke()
+        self.assertTrue(self.app.brain.settings.enabled)
+        self.assertEqual(self.app.brain.settings.api_key, 'test-key')
+        self.assertTrue(self.app.world.paused)
+        self.assertNotIn('test-key', json.dumps(self.app.world.snapshot()))
+
+    def test_lore_editor_import_layers_and_persistence(self):
+        editor = LoreEditor(self.app)
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'nera.json'
+            source.write_text('[{"id":"g","content":"  Дуб\\nЛес  ","global":true}]', encoding='utf-8')
+            with patch('ostrov.lore_editor.filedialog.askopenfilename', return_value=str(source)):
+                editor.import_json()
+            with patch('ostrov.lore_editor.filedialog.askopenfilename', return_value=str(source)), patch('ostrov.lore_editor.messagebox.showerror') as error:
+                editor.import_json()
+                error.assert_called_once()
+            editor.mode.set('Инструкции модели')
+            editor.switch()
+            editor.editor.delete('1.0', 'end')
+            editor.editor.insert('1.0', '[{"content":"Краткие реплики"}]')
+            editor.apply()
+            self.assertEqual(self.app.world.global_lore[0]['content'], '  Дуб\nЛес  ')
+            self.assertEqual(context(self.app.world)['instruction_packs'], 'Краткие реплики')
+            target = Path(directory) / 'world.sqlite3'
+            from ostrov.storage import save
+            save(self.app.world, target)
+            self.assertEqual(load(target).global_lore, self.app.world.global_lore)

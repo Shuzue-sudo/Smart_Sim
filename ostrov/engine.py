@@ -34,6 +34,11 @@ class World:
         self.end_reason = None
         self.generation = 0
         self.events = []
+        self.brain_history = []
+        self.lore_entries = {}
+        self.global_lore = []
+        self.instruction_packs = []
+        self.shared_world = ''
         self.creatures = {"rosmontis": Creature("rosmontis", "Росмонтис")}
         self.boundary = self._boundary()
         self._schedule()
@@ -113,6 +118,18 @@ class World:
             self._shift()
         if not self.ended:
             self.time = target
+
+    def walk(self, creature_id, dx, dy):
+        """Validated short movement, checking the entire path for a fall."""
+        if any(type(v) not in (int, float) or abs(v) > 2 or not math.isfinite(v) for v in (dx, dy)) or math.hypot(dx, dy) > 2:
+            raise ValueError("Шаг должен быть конечным и не длиннее 2 м")
+        creature = self.creatures[creature_id]
+        start_x, start_y = creature.x, creature.y
+        steps = max(1, math.ceil(math.hypot(dx, dy) / .1))
+        for i in range(1, steps + 1):
+            self.move(creature_id, start_x + dx * i / steps, start_y + dy * i / steps)
+            if creature.status != 'active':
+                break
 
     def _shift(self):
         for creature in self.creatures.values():
